@@ -1,0 +1,1552 @@
+import os
+import torch
+import torch.nn.functional as F
+from ultralytics import YOLO
+from ultralytics.engine.trainer import BaseTrainer
+from ultralytics.utils import DEFAULT_CFG, RANK, colorstr
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.models.yolo.detect import DetectionTrainer
+from pathlib import Path
+import numpy as np
+import cv2
+import random
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+
+class MusicNotationTrainer(DetectionTrainer):
+    """
+    自定義的音符檢測訓練器，繼承自YOLOv8的DetectionTrainer
+    """
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        """初始化訓練器，設置特定於音符檢測的參數"""
+        super().__init__(cfg, overrides, _callbacks)
+
+        # 嘗試從模型的自定義參數獲取音符檢測特定的超參數
+        if hasattr(self.args, 'model') and hasattr(self.args.model, 'custom_args'):
+            custom_args = self.args.model.custom_args
+            self.music_note_weight = custom_args.get('music_note_weight', 2.0)
+            self.shape_loss_weight = custom_args.get('shape_loss_weight', 0.5)
+            self.focal_gamma = custom_args.get('focal_gamma', 2.0)
+            self.rare_class_weight = custom_args.get('rare_class_weight', 3.0)
+            self.rare_class_threshold = custom_args.get('rare_class_threshold', 30)
+            self.enhanced_augmentation = custom_args.get('enhanced_augmentation', True)
+            self.mixed_precision = custom_args.get('mixed_precision', True)
+            self.feature_pyramid_enhancement = custom_args.get('feature_pyramid_enhancement', True)
+            self.gradient_accumulation_steps = custom_args.get('gradient_accumulation_steps', 1)
+        else:
+            # 使用默認值
+            self.music_note_weight = 2.0
+            self.shape_loss_weight = 0.5
+            self.focal_gamma = 2.0
+            self.rare_class_weight = 3.0
+            self.rare_class_threshold = 30
+            self.enhanced_augmentation = True
+            self.mixed_precision = True
+            self.feature_pyramid_enhancement = True
+            self.gradient_accumulation_steps = 1
+
+        # 記錄各類別樣本數
+        self.class_counts = None
+
+        # 模型預熱參數
+        self.warmup_epochs = getattr(self.args, 'warmup_epochs', 5)
+
+        # 當前累積步數
+        self.accumulation_step = 0
+
+        print(f"{colorstr('MusicNotationTrainer:')} 初始化完成")
+        print(f"音符權重: {self.music_note_weight}, 形狀損失權重: {self.shape_loss_weight}, Focal gamma: {self.focal_gamma}")
+        print(f"稀有類別權重: {self.rare_class_weight}, 稀有類別閾值: {self.rare_class_threshold}")
+        print(f"使用增強數據增強: {self.enhanced_augmentation}, 使用混合精度: {self.mixed_precision}")
+        print(f"梯度累積步數: {self.gradient_accumulation_steps}")
+
+    def preprocess_batch(self, batch):
+        """預處理批次數據，增強稀有類別的處理"""
+        # 首先使用原始的預處理
+        batch = super().preprocess_batch(batch)
+
+        # 分析批次中的類別分布
+        if 'cls' in batch:
+            target_cls = batch['cls']
+        elif 'labels' in batch:
+            target_cls = batch['labels']
+        else:
+            cls_keys = [k for k in batch.keys() if 'cls' in k.lower() or 'label' in k.lower()]
+            if cls_keys:
+                target_cls = batch[cls_keys[0]]
+
+        # 如果有類別標籤，分析並記錄各類別數量
+        if 'target_cls' in locals() and target_cls is not None:
+            # 計算這批次中各類別的數量
+            if isinstance(target_cls, torch.Tensor) and target_cls.dim() > 1:
+                batch_class_counts = torch.sum(target_cls, dim=(0, 1)) if target_cls.dim() > 2 else torch.sum(
+                    target_cls, dim=0)
+
+                # 更新全局類別計數
+                if self.class_counts is None:
+                    self.class_counts = batch_class_counts.detach().cpu().numpy()
+                else:
+                    self.class_counts += batch_class_counts.detach().cpu().numpy()
+
+                # 每100個批次打印一次類別分布
+                if self.batch_i % 100 == 0 and RANK == 0:
+                    print(f"\nEpoch {self.epoch}, Batch {self.batch_i} - 類別分布:")
+                    for i, count in enumerate(self.class_counts):
+                        print(f"  類別 {i}: {count}")
+
+        # 如果啟用了增強的數據增強，在這裡可以添加更多的增強操作
+        if self.enhanced_augmentation and self.epoch < self.epochs * 0.8:  # 前80%的epochs使用增強
+            # 可以根據當前epoch調整增強強度
+            aug_intensity = min(0.8, 0.3 + (self.epoch / self.epochs) * 0.5)  # 隨著訓練進行逐漸增加強度
+
+            # 這裡可以添加音符檢測特定的增強，例如輕微旋轉、透視變換等
+            # 注意：需要根據YOLOv8的批次結構來修改，以下僅為示例
+
+            if 'img' in batch and isinstance(batch['img'], torch.Tensor):
+                # 轉換為numpy以便處理
+                imgs = batch['img'].detach().cpu().numpy().transpose(0, 2, 3, 1)
+
+                # 對每個圖像應用增強
+                for i in range(len(imgs)):
+                    if random.random() < aug_intensity:
+                        # 隨機選擇一種增強方法
+                        aug_choice = random.choice(['rotate', 'perspective', 'brightness', 'contrast', 'noise'])
+
+                        if aug_choice == 'rotate':
+                            # 輕微旋轉，不會影響音符識別
+                            angle = random.uniform(-5, 5)
+                            imgs[i] = np.array(Image.fromarray((imgs[i] * 255).astype(np.uint8)).rotate(angle,
+                                                                                                        resample=Image.BILINEAR))
+
+                        elif aug_choice == 'perspective':
+                            # 輕微透視變換
+                            height, width = imgs[i].shape[:2]
+                            scale = 0.05
+                            pts1 = np.float32([[0, 0], [width, 0], [0, height], [width, height]])
+                            pts2 = np.float32([
+                                [0 + random.uniform(-width * scale, width * scale),
+                                 0 + random.uniform(-height * scale, height * scale)],
+                                [width + random.uniform(-width * scale, width * scale),
+                                 0 + random.uniform(-height * scale, height * scale)],
+                                [0 + random.uniform(-width * scale, width * scale),
+                                 height + random.uniform(-height * scale, height * scale)],
+                                [width + random.uniform(-width * scale, width * scale),
+                                 height + random.uniform(-height * scale, height * scale)]
+                            ])
+                            M = cv2.getPerspectiveTransform(pts1, pts2)
+                            imgs[i] = cv2.warpPerspective(imgs[i], M, (width, height))
+
+                        elif aug_choice == 'brightness':
+                            # 亮度調整
+                            factor = random.uniform(0.8, 1.2)
+                            imgs[i] = np.clip(imgs[i] * factor, 0, 1)
+
+                        elif aug_choice == 'contrast':
+                            # 對比度調整
+                            img_pil = Image.fromarray((imgs[i] * 255).astype(np.uint8))
+                            enhancer = ImageEnhance.Contrast(img_pil)
+                            factor = random.uniform(0.8, 1.2)
+                            img_pil = enhancer.enhance(factor)
+                            imgs[i] = np.array(img_pil) / 255.0
+
+                        elif aug_choice == 'noise':
+                            # 添加輕微噪聲
+                            noise = np.random.normal(0, 0.05, imgs[i].shape)
+                            imgs[i] = np.clip(imgs[i] + noise, 0, 1)
+
+                # 轉換回torch tensor
+                batch['img'] = torch.from_numpy(imgs.transpose(0, 3, 1, 2)).to(batch['img'].device)
+
+        return batch
+
+    def get_model(self, weights=None, cfg=None, hyp=None, verbose=True):
+        """獲取模型，增強模型架構"""
+        model = super().get_model(weights, cfg, hyp, verbose)
+
+        # 如果啟用了特徵金字塔增強，添加額外的特徵處理
+        if self.feature_pyramid_enhancement:
+            if verbose and RANK == 0:
+                print(f"{colorstr('Model Enhancement:')} 啟用特徵金字塔增強")
+
+            # 注意：這裡需要根據實際的YOLOv8模型結構進行修改
+            # 以下僅為示意代碼，實際實現可能需要更深入了解YOLOv8的模型結構
+
+            try:
+                # 這部分代碼假設我們可以訪問並修改模型的某些層
+                # 實際操作需要根據具體的YOLOv8模型架構來調整
+                if hasattr(model, 'model') and hasattr(model.model, 'detect'):
+                    # 在檢測頭部增加注意力機制
+                    print("增強檢測頭部...")
+                else:
+                    if verbose and RANK == 0:
+                        print("無法修改模型架構，使用原始模型繼續")
+            except Exception as e:
+                if verbose and RANK == 0:
+                    print(f"模型增強失敗: {e}")
+                    print("使用原始模型繼續")
+
+        return model
+
+    def custom_focal_loss(self, pred_cls, target_cls):
+        """
+        改進的 Focal Loss 實現，專為不平衡的音符數據集設計，並特別加強對稀有類別的關注
+
+        參數:
+            pred_cls: 模型預測的類別分數 [batch_size, num_anchors, num_classes]
+            target_cls: 目標類別標籤 [batch_size, num_anchors, num_classes]
+
+        返回:
+            loss: 計算的損失值
+        """
+        # 計算標準的二元交叉熵損失
+        bce_loss = F.binary_cross_entropy_with_logits(pred_cls, target_cls, reduction='none')
+
+        # 計算 pt (預測概率)
+        pt = torch.exp(-bce_loss)
+
+        # 應用增強版 Focal Loss 公式: -(1-pt)^gamma * log(pt)
+        # 使用更高的 gamma 值使模型更加關注難分類樣本
+        focal_weight = (1 - pt) ** self.focal_gamma
+
+        # 根據數據分布計算類別權重
+        # 首先統計每個類別的樣本數量
+        class_counts = target_cls.sum(dim=(0, 1))
+
+        # 防止除以零
+        class_counts = torch.clamp(class_counts, min=1.0)
+
+        # 計算逆頻率權重：樣本越少，權重越高
+        # 使用 sqrt 來緩和極端不平衡情況
+        total_samples = class_counts.sum()
+        inv_freq_weights = torch.sqrt(total_samples / class_counts)
+
+        # 標準化權重，使其平均值為1
+        inv_freq_weights = inv_freq_weights * (len(inv_freq_weights) / inv_freq_weights.sum())
+
+        # 特別加強對稀有類別的權重
+        # 如果當前批次中某個類別的樣本數低於稀有類別閾值，增加其權重
+        rare_class_mask = class_counts < self.rare_class_threshold
+        if rare_class_mask.any():
+            # 增加稀有類別的權重
+            inv_freq_weights[rare_class_mask] *= self.rare_class_weight
+
+            # 重新標準化
+            inv_freq_weights = inv_freq_weights * (len(inv_freq_weights) / inv_freq_weights.sum())
+
+        # 將權重擴展到與 target_cls 相同的形狀
+        # [num_classes] -> [batch_size, num_anchors, num_classes]
+        expanded_weights = inv_freq_weights.expand_as(target_cls)
+
+        # 僅對實際目標應用權重
+        class_weight = 1.0 + (expanded_weights - 1.0) * target_cls
+
+        # 針對相似音符的特殊處理
+        # 假設類別 0-4 是外觀相似的音符（如全音符、半音符等）
+        similar_note_indices = [0, 1, 2, 3, 4]  # 調整為實際相似的音符類別索引
+
+        # 針對休止符特別處理 (全休止符、半休止符、四分休止符、八分休止符)
+        rest_indices = [8, 9, 10, 11, 12]  # 調整為實際的休止符類別索引
+
+        # 對相似音符和休止符添加額外權重
+        is_similar_note = torch.zeros_like(target_cls)
+        is_rest = torch.zeros_like(target_cls)
+
+        for idx in similar_note_indices:
+            if idx < target_cls.size(-1):
+                is_similar_note[:, :, idx] = 1
+
+        for idx in rest_indices:
+            if idx < target_cls.size(-1):
+                is_rest[:, :, idx] = 1
+
+        # 對相似音符類型添加額外的權重，使模型更加關注它們之間的差異
+        similar_note_weight = 1.0 + 0.8 * is_similar_note * target_cls
+
+        # 對休止符類型添加更高的權重，因為它們在評估結果中表現不佳
+        rest_weight = 1.0 + 1.5 * is_rest * target_cls
+
+        # 結合所有權重
+        combined_weight = focal_weight * class_weight * similar_note_weight * rest_weight
+
+        # 計算最終的損失
+        loss = bce_loss * combined_weight
+
+        # 記錄類別權重以便可視化和分析
+        if self.batch_i % 100 == 0 and RANK == 0:  # 每100個批次記錄一次
+            with open(os.path.join(self.save_dir, 'class_weights.txt'), 'a') as f:
+                f.write(
+                    f"Epoch {self.epoch}, Batch {self.batch_i}: Class weights: {inv_freq_weights.detach().cpu().numpy()}\n")
+                # 記錄每個類別的樣本數量
+                f.write(
+                    f"Epoch {self.epoch}, Batch {self.batch_i}: Class counts: {class_counts.detach().cpu().numpy()}\n")
+                # 記錄稀有類別
+                f.write(
+                    f"Epoch {self.epoch}, Batch {self.batch_i}: Rare classes: {torch.nonzero(rare_class_mask).flatten().detach().cpu().numpy()}\n")
+
+        return loss.mean()
+
+    def shape_awareness_loss(self, pred_bbox, target_bbox, target_cls):
+        """
+        增強版形狀感知損失，特別關注音符的關鍵幾何特性和休止符的形狀特征
+
+        參數:
+            pred_bbox: 預測的邊界框 [batch_size, num_anchors, 4]
+            target_bbox: 目標邊界框 [batch_size, num_anchors, 4]
+            target_cls: 目標類別 [batch_size, num_anchors, num_classes]
+
+        返回:
+            loss: 計算的損失值
+        """
+        # 1. 高寬比損失 - 這對區分不同類型的音符很重要
+        pred_h = pred_bbox[..., 3] - pred_bbox[..., 1]  # 高度
+        pred_w = pred_bbox[..., 2] - pred_bbox[..., 0]  # 寬度
+        pred_ratio = pred_h / (pred_w + 1e-16)  # 避免除以零
+
+        target_h = target_bbox[..., 3] - target_bbox[..., 1]
+        target_w = target_bbox[..., 2] - target_bbox[..., 0]
+        target_ratio = target_h / (target_w + 1e-16)
+
+        # 使用 Huber 損失代替 MSE，對異常值更加魯棒
+        ratio_loss = F.smooth_l1_loss(pred_ratio, target_ratio, reduction='none', beta=0.1)
+
+        # 2. 形狀一致性損失 - 音符的一致性對於正確分類很重要
+        # 計算面積
+        pred_area = pred_h * pred_w
+        target_area = target_h * target_w
+
+        # 面積相對誤差
+        area_diff = torch.abs(pred_area - target_area) / (target_area + 1e-16)
+        area_loss = torch.clamp(area_diff, 0, 1)  # 限制在 [0,1] 範圍內
+
+        # 3. 中心點損失 - 音符的位置通常很重要
+        pred_cx = (pred_bbox[..., 0] + pred_bbox[..., 2]) / 2
+        pred_cy = (pred_bbox[..., 1] + pred_bbox[..., 3]) / 2
+
+        target_cx = (target_bbox[..., 0] + target_bbox[..., 2]) / 2
+        target_cy = (target_bbox[..., 1] + target_bbox[..., 3]) / 2
+
+        # 標準化中心點誤差（相對於邊界框大小）
+        cx_diff = torch.abs(pred_cx - target_cx) / (target_w + 1e-16)
+        cy_diff = torch.abs(pred_cy - target_cy) / (target_h + 1e-16)
+        center_loss = (cx_diff + cy_diff) / 2
+
+        # 4. IoU損失 - 增加對整體邊界框重疊的關注
+        # 計算IoU (交集除以併集)
+        inter_x1 = torch.max(pred_bbox[..., 0], target_bbox[..., 0])
+        inter_y1 = torch.max(pred_bbox[..., 1], target_bbox[..., 1])
+        inter_x2 = torch.min(pred_bbox[..., 2], target_bbox[..., 2])
+        inter_y2 = torch.min(pred_bbox[..., 3], target_bbox[..., 3])
+
+        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+        union_area = pred_area + target_area - inter_area + 1e-16
+
+        iou = inter_area / union_area
+        iou_loss = 1 - iou  # 轉換為損失
+
+        # 5. 根據音符類型加權形狀損失
+        # 不同類型的音符可能需要不同的形狀關注度
+        # 獲取類別索引（假設每個錨點只有一個類別）
+        class_indices = torch.argmax(target_cls, dim=-1)
+
+        # 創建類別特定的權重矩陣
+        shape_weights = torch.ones_like(ratio_loss)
+
+        # 音符頭部類別（例如類別0，1）- 更關注高寬比
+        note_head_mask = (class_indices == 0) | (class_indices == 1)
+        shape_weights[note_head_mask] = 1.5
+
+        # 帶有符干的音符（例如類別2，3，4）- 更關注整體形狀
+        stemmed_note_mask = (class_indices == 2) | (class_indices == 3) | (class_indices == 4)
+        shape_weights[stemmed_note_mask] = 1.2
+
+        # 休止符類別 - 更關注精確的形狀和位置
+        rest_mask = (class_indices >= 8) & (class_indices <= 12)
+        shape_weights[rest_mask] = 2.0  # 對休止符給予更高的權重
+
+        # 僅對有效的邊界框計算損失
+        valid_bbox_mask = (target_cls.sum(-1) > 0).float()
+
+        # 組合所有形狀損失，加強對IoU的關注
+        combined_shape_loss = (0.3 * ratio_loss + 0.2 * area_loss + 0.2 * center_loss + 0.3 * iou_loss) * shape_weights
+
+        # 應用掩碼並計算平均損失
+        masked_loss = (combined_shape_loss * valid_bbox_mask).sum() / (valid_bbox_mask.sum() + 1e-16)
+
+        return masked_loss
+
+    def similarity_loss(self, pred_cls, target_cls, pred_bbox, target_bbox):
+        """
+        相似性損失 - 專門針對相似音符區分的損失函數，尤其加強對績效不佳類別的處理
+
+        參數:
+            pred_cls: 預測的類別分數
+            target_cls: 目標類別標籤
+            pred_bbox: 預測的邊界框
+            target_bbox: 目標邊界框
+
+        返回:
+            loss: 相似性損失值
+        """
+        # 定義相似音符組（可根據評估結果和實際情況調整）
+        similar_groups = [
+            [0, 1],  # 例如：全音符和半音符
+            [2, 3, 4],  # 例如：四分音符、八分音符和十六分音符
+            [8, 9],  # 全休止符和半休止符
+            [10, 11, 12]  # 四分休止符、八分休止符和十六分休止符
+        ]
+
+        batch_size = pred_cls.size(0)
+        similarity_losses = []
+
+        # 針對每個相似組計算損失
+        for group in similar_groups:
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    idx1, idx2 = group[i], group[j]
+
+                    if idx1 >= pred_cls.size(-1) or idx2 >= pred_cls.size(-1):
+                        continue
+
+                    # 獲取這兩個類別的預測和目標
+                    pred1 = pred_cls[..., idx1]
+                    pred2 = pred_cls[..., idx2]
+                    target1 = target_cls[..., idx1]
+                    target2 = target_cls[..., idx2]
+
+                    # 找出哪些位置是這兩個類別之一
+                    is_either_class = (target1 > 0) | (target2 > 0)
+
+                    if is_either_class.sum() == 0:
+                        continue  # 跳過當前批次中沒有這兩個類別的情況
+
+                    # 計算這兩個類別之間的對比損失
+                    # 如果實際是類別1，則預測類別1的分數應該高於類別2，反之亦然
+                    margin = 0.3  # 邊界參數，增加邊界值以加強區分
+
+                    # 計算額外權重因子，對績效不佳的類別加強處理
+                    # 全休止符(8)、半休止符(9)、四分休止符(10)、八分休止符(11)都是績效不佳的類別
+                    problem_classes = [8, 9, 10, 11, 12]
+                    weight_factor1 = 2.0 if idx1 in problem_classes else 1.0
+                    weight_factor2 = 2.0 if idx2 in problem_classes else 1.0
+
+                    # 對於實際是類別1的樣本
+                    class1_samples = (target1 > 0)
+                    if class1_samples.sum() > 0:
+                        # 類別1的預測應該比類別2高出至少margin
+                        contrast_loss1 = torch.clamp(pred2 - pred1 + margin, min=0) * weight_factor1
+                        similarity_losses.append((contrast_loss1 * class1_samples).sum() / class1_samples.sum())
+
+                    # 對於實際是類別2的樣本
+                    class2_samples = (target2 > 0)
+                    if class2_samples.sum() > 0:
+                        # 類別2的預測應該比類別1高出至少margin
+                        contrast_loss2 = torch.clamp(pred1 - pred2 + margin, min=0) * weight_factor2
+                        similarity_losses.append((contrast_loss2 * class2_samples).sum() / class2_samples.sum())
+
+        # 如果沒有計算任何相似性損失，返回0
+        if len(similarity_losses) == 0:
+            return torch.tensor(0.0, device=pred_cls.device)
+
+        # 返回所有相似性損失的平均值
+        return torch.stack(similarity_losses).mean()
+
+    def false_positive_reduction_loss(self, pred_cls, target_cls):
+        """
+        減少誤檢測的專用損失函數，特別針對容易混淆的類別
+
+        參數:
+            pred_cls: 預測的類別分數
+            target_cls: 目標類別標籤
+
+        返回:
+            loss: 誤檢測減少損失
+        """
+        # 找出所有負樣本 (背景)
+        negative_samples = (target_cls.sum(-1) == 0).float().unsqueeze(-1)
+
+        # 對於負樣本，所有類別的預測分數都應該低
+        # 使用 ReLU 來只懲罰高於閾值的預測
+        confidence_threshold = 0.3
+        false_positive_penalty = F.relu(pred_cls - confidence_threshold) * negative_samples
+
+        # 對於容易混淆的類別，加強懲罰
+        # 例如，休止符類別在評估中表現較差，可能是由於誤檢測
+        problematic_class_indices = [8, 9, 10, 11, 12]  # 休止符類別
+
+        # 創建一個掩碼來標識這些類別
+        problem_class_mask = torch.zeros_like(pred_cls)
+        for idx in problematic_class_indices:
+            if idx < pred_cls.size(-1):
+                problem_class_mask[..., idx] = 1.0
+
+        # 對問題類別的誤檢測增加懲罰
+        weighted_false_positive_penalty = false_positive_penalty * (1.0 + problem_class_mask)
+
+        # 計算平均損失
+        num_negatives = negative_samples.sum() + 1e-16
+        return weighted_false_positive_penalty.sum() / num_negatives
+
+    def adaptive_class_weighting(self, current_epoch):
+        """根據當前訓練階段動態調整類別權重策略"""
+        # 在訓練初期強調樣本平衡
+        if current_epoch < self.epochs * 0.3:  # 前30%的epochs
+            self.music_note_weight = 1.5
+            self.rare_class_weight = 3.0
+            self.shape_loss_weight = 0.3
+            self.focal_gamma = 2.0
+        # 在訓練中期關注形狀特徵
+        elif current_epoch < self.epochs * 0.6:  # 30%-60%的epochs
+            self.music_note_weight = 2.0
+            self.rare_class_weight = 2.5
+            self.shape_loss_weight = 0.6
+            self.focal_gamma = 1.8
+        # 在訓練後期細化難分類的樣本
+        else:  # 最後40%的epochs
+            self.music_note_weight = 2.5
+            self.rare_class_weight = 2.0
+            self.shape_loss_weight = 0.5
+            self.focal_gamma = 1.5
+
+    def get_loss(self, batch, preds):
+        """
+        增強版自定義損失計算，結合多種損失來改進樂譜音符識別
+        """
+        # 動態調整類別權重策略
+        self.adaptive_class_weighting(self.epoch)
+
+        # 首先獲取原始損失
+        loss, loss_items = super().get_loss(batch, preds)
+
+        # 嘗試獲取預測和目標
+        try:
+            # 檢查批次和預測的具體結構，以便正確訪問
+            if self.epoch == 0 and self.batch_i == 0 and RANK == 0:
+                print("\n分析批次和預測的結構:")
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        print(f"batch['{k}'] shape: {v.shape}, dtype: {v.dtype}")
+                    else:
+                        print(f"batch['{k}'] type: {type(v)}")
+
+                print("\n預測結構:")
+                for i, p in enumerate(preds):
+                    if isinstance(p, torch.Tensor):
+                        print(f"preds[{i}] shape: {p.shape}, dtype: {p.dtype}")
+                    elif isinstance(p, (list, tuple)):
+                        print(f"preds[{i}] type: {type(p)}, len: {len(p)}")
+                        for j, sp in enumerate(p):
+                            if isinstance(sp, torch.Tensor):
+                                print(f"  preds[{i}][{j}] shape: {sp.shape}, dtype: {sp.dtype}")
+                    else:
+                        print(f"preds[{i}] type: {type(p)}")
+
+            # 根據YOLOv8的具體實現提取預測和目標
+            pred_cls = None
+            pred_bbox = None
+            target_cls = None
+            target_bbox = None
+
+            # 嘗試從不同可能的結構中獲取預測
+            if isinstance(preds, list) and len(preds) > 0:
+                if isinstance(preds[0], torch.Tensor):
+                    pred_cls = preds[0]  # 假設第一個元素是分類預測
+                    if len(preds) > 1:
+                        pred_bbox = preds[1]  # 假設第二個元素是邊界框預測
+                elif isinstance(preds[0], (list, tuple)) and len(preds[0]) > 0:
+                    pred_cls = preds[0][0]  # 假設 preds[0][0] 是分類預測
+                    if len(preds[0]) > 1:
+                        pred_bbox = preds[0][1]  # 假設 preds[0][1] 是邊界框預測
+
+            # 如果上面的方法失敗，嘗試查找模型中的預測張量
+            if pred_cls is None and hasattr(self, 'model'):
+                # 嘗試從模型的outputs或其他屬性獲取預測
+                pass  # 這部分需要根據YOLOv8實際結構調整
+
+            # 從批次中提取目標
+            if 'cls' in batch:
+                target_cls = batch['cls']
+            elif 'labels' in batch:
+                target_cls = batch['labels']
+            else:
+                # 嘗試找到包含類別信息的鍵
+                cls_keys = [k for k in batch.keys() if 'cls' in k.lower() or 'label' in k.lower()]
+                if cls_keys:
+                    target_cls = batch[cls_keys[0]]
+                else:
+                    # 最後嘗試從batch中收集所有tensor檢查形狀
+                    for k, v in batch.items():
+                        if isinstance(v, torch.Tensor) and v.dim() > 1 and v.size(-1) > 1:
+                            # 這可能是類別標籤
+                            print(f"嘗試使用 {k} 作為類別標籤，形狀: {v.shape}")
+                            target_cls = v
+                            break
+
+                    if target_cls is None:
+                        raise KeyError("找不到分類目標")
+
+            if 'bboxes' in batch:
+                target_bbox = batch['bboxes']
+            elif 'boxes' in batch:
+                target_bbox = batch['boxes']
+            else:
+                # 嘗試找到包含邊界框信息的鍵
+                bbox_keys = [k for k in batch.keys() if 'box' in k.lower() or 'bbox' in k.lower()]
+                if bbox_keys:
+                    target_bbox = batch[bbox_keys[0]]
+                elif pred_bbox is not None:
+                    # 如果有預測邊界框但找不到目標，再次嘗試從batch中找出可能的邊界框
+                    for k, v in batch.items():
+                        if isinstance(v, torch.Tensor) and v.size(-1) == 4:
+                            # 這可能是邊界框
+                            print(f"嘗試使用 {k} 作為邊界框，形狀: {v.shape}")
+                            target_bbox = v
+                            break
+
+                    if target_bbox is None:
+                        raise KeyError("找不到邊界框目標")
+                else:
+                    target_bbox = None  # 如果不需要邊界框損失，可以設為None
+
+            # 計算自定義損失
+            if pred_cls is not None and target_cls is not None:
+                # 1. 自定義 Focal Loss
+                custom_focal = self.custom_focal_loss(pred_cls, target_cls)
+
+                # 2. 相似性損失和形狀損失 (如果有邊界框預測和目標)
+                if pred_bbox is not None and target_bbox is not None:
+                    shape_loss = self.shape_awareness_loss(pred_bbox, target_bbox, target_cls)
+                    similarity_loss = self.similarity_loss(pred_cls, target_cls, pred_bbox, target_bbox)
+                else:
+                    shape_loss = torch.tensor(0.0, device=pred_cls.device)
+                    similarity_loss = torch.tensor(0.0, device=pred_cls.device)
+
+                # 3. 誤檢測減少損失
+                false_positive_loss = self.false_positive_reduction_loss(pred_cls, target_cls)
+
+                # 4. 綜合損失 - 根據訓練階段自動調整權重
+                # 隨著訓練進行，提高形狀和相似性損失的權重
+                progress_factor = min(1.0, self.epoch / (self.epochs * 0.7))
+                shape_weight = self.shape_loss_weight * (1.0 + progress_factor)
+                similarity_weight = 0.3 * (1.0 + 0.5 * progress_factor)
+
+                # 計算綜合損失
+                custom_loss = (custom_focal * 0.5 +
+                               shape_loss * shape_weight +
+                               similarity_loss * similarity_weight +
+                               false_positive_loss * 0.2)
+
+                # 將自定義損失添加到總損失中，但根據梯度累積步數進行縮放
+                if self.gradient_accumulation_steps > 1:
+                    custom_loss = custom_loss / self.gradient_accumulation_steps
+
+                loss = loss + custom_loss
+
+                # 打印損失值以便調試
+                if RANK == 0 and self.epoch % 5 == 0 and self.batch_i % 100 == 0:  # 定期打印
+                    print(f"\nEpoch {self.epoch}, Batch {self.batch_i}:")
+                    print(f"  原始損失: {loss_items.sum().item():.4f}")
+                    print(f"  自定義Focal損失: {custom_focal.item():.4f}")
+                    print(f"  形狀損失: {shape_loss.item():.4f}")
+                    print(f"  相似性損失: {similarity_loss.item():.4f}")
+                    print(f"  誤檢測減少損失: {false_positive_loss.item():.4f}")
+                    print(f"  總自定義損失: {custom_loss.item():.4f}")
+                    print(f"  最終損失: {loss.item():.4f}")
+
+                # 將自定義損失記錄到訓練日誌中
+                if hasattr(self, 'log_dict'):
+                    self.log_dict.update({
+                        'custom_focal': custom_focal.item(),
+                        'shape_loss': shape_loss.item(),
+                        'similarity_loss': similarity_loss.item(),
+                        'false_positive_loss': false_positive_loss.item()
+                    })
+
+                # 處理梯度累積
+                if self.gradient_accumulation_steps > 1:
+                    self.accumulation_step += 1
+                    # 當累積步數達到設定值時，才更新優化器
+                    if self.accumulation_step >= self.gradient_accumulation_steps:
+                        self.accumulation_step = 0
+                        # 這裡不需要手動更新，因為優化器的步進會在trainer的train_step中處理
+
+        except Exception as e:
+            # 如果出錯，打印詳細錯誤信息但繼續使用原始損失
+            if RANK == 0:
+                import traceback
+                print(f"\n自定義損失計算錯誤: {e}")
+                print(traceback.format_exc())
+                print("使用原始損失繼續訓練")
+
+        return loss, loss_items
+
+    def plot_training_samples(self, batch, ni):
+        """
+        自定義訓練樣本的可視化，增強對問題類別的展示
+        """
+        # 使用原始的可視化方法
+        super().plot_training_samples(batch, ni)
+
+        # 可以在這裡添加額外的音符特定可視化
+        # 例如標記不同類型的音符，或顯示難分類樣本的分布
+
+    def plot_metrics(self):
+        """
+        自定義指標可視化，重點展示每個類別的性能
+        """
+        # 使用原始的指標可視化
+        super().plot_metrics()
+
+        # 可以在這裡添加音符檢測特定的可視化，例如不同類別的性能對比圖
+
+    def final_eval(self):
+        """
+        訓練結束後的最終評估，增加對各類別性能的詳細分析
+        """
+        # 使用原始的最終評估
+        results = super().final_eval()
+
+        # 添加音符檢測特定的評估和分析
+        try:
+            print("\n" + colorstr("音符檢測詳細評估:"))
+
+            # 分析哪些類別表現好，哪些類別仍然需要改進
+            if hasattr(results, 'box') and hasattr(results.box, 'cls_dict'):
+                problem_classes = []
+                good_classes = []
+
+                for cls_idx, metrics in results.box.cls_dict.items():
+                    class_name = self.names[int(cls_idx)] if hasattr(self, 'names') else f"類別 {int(cls_idx)}"
+                    map50 = metrics.get('map50', 0)
+
+                    if map50 < 0.5:
+                        problem_classes.append((class_name, map50))
+                    elif map50 > 0.8:
+                        good_classes.append((class_name, map50))
+
+                if problem_classes:
+                    print("\n需要改進的類別:")
+                    for cls, score in sorted(problem_classes, key=lambda x: x[1]):
+                        print(f"  - {cls}: mAP@0.5 = {score:.4f}")
+
+                if good_classes:
+                    print("\n表現良好的類別:")
+                    for cls, score in sorted(good_classes, key=lambda x: x[1], reverse=True):
+                        print(f"  - {cls}: mAP@0.5 = {score:.4f}")
+
+                # 顯示整體指標
+                print(f"\n整體指標:")
+                print(f"  - mAP@0.5: {results.box.map50:.4f}")
+                print(f"  - mAP@0.5:0.95: {results.box.map:.4f}")
+                print(f"  - 精確度: {results.box.p:.4f}")
+                print(f"  - 召回率: {results.box.r:.4f}")
+
+        except Exception as e:
+            print(f"詳細評估分析出錯: {e}")
+
+        print("\n" + colorstr("音符檢測") + " 訓練完成!")
+
+        return results
+
+
+class MusicNotationDetector:
+    def __init__(self, dataset_path="D:/music/datasets"):
+        self.dataset_path = dataset_path
+        self.model = None
+        self.config_path = os.path.join(os.getcwd(), "music_notation.yaml")
+        self.class_names = ['Whole Note', 'Half Note', 'Quarter Note', 'Eight Note', 'Sixteenth Note',
+                            'Treble clef', 'Bass clef', 'Alto clef', 'Whole rest', 'Half rest', 'Quarter rest',
+                            'Eighth rest', 'Sixteenth rest', 'Sharp', 'Flat',
+                            'Natural']  # 根據你的實際標籤修改
+
+    def prepare_config(self):
+        """準備訓練配置文件"""
+        # 創建YAML配置文件
+        yaml_content = f"""
+# YOLOv11 音符物件偵測配置
+path: {self.dataset_path}
+train: train/images
+val: val/images
+test: test/images
+
+# 類別設置
+nc: {len(self.class_names)}  # 類別數量
+names: {self.class_names}  # 類別名稱
+"""
+
+        # 保存YAML文件
+        with open(self.config_path, "w") as f:
+            f.write(yaml_content)
+
+        print(f"配置文件已創建於: {self.config_path}")
+        return self.config_path
+
+    def remove_staff_lines():
+        # 批量去除五线谱
+
+        import cv2
+        import numpy as np
+        import os
+
+        # 1. 設置圖像資料夾路徑和保存目錄
+        input_dir = r"D:\music\datasets"  # 替換為你的圖像資料夾路徑
+        output_dir = r"D:\music\datasets"
+
+        # 確保輸出目錄存在
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # 2. 遍歷資料夾中的所有圖片
+        for filename in os.listdir(input_dir):
+            # 檢查文件是否為圖片格式
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
+                # 構建完整文件路徑
+                image_path = os.path.join(input_dir, filename)
+
+                # 3. 讀取圖像
+                image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    print(f"無法讀取圖片: {image_path}")
+                    continue
+
+                # 4. 二值化處理
+                _, binary = cv2.threshold(image, 128, 255, cv2.THRESH_BINARY_INV)
+
+                # 5. 檢測水平線（五線譜）
+                horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 1))  # 橫向內核
+                detected_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+
+                # 6. 去除線條
+                lines_removed = cv2.subtract(binary, detected_lines)
+
+                # 7. 恢復音符
+                # result = cv2.bitwise_or(image, cv2.bitwise_not(lines_removed))
+
+                # 8. 保存結果
+                base_filename = os.path.splitext(filename)[0]  # 獲取文件名（不含擴展名）
+                cv2.imwrite(os.path.join(output_dir, f"{base_filename}.png"), cv2.bitwise_not(lines_removed))  # 無五線譜
+                # cv2.imwrite(os.path.join(output_dir, f"{base_filename}_no_staff.png"), cv2.bitwise_not(lines_removed))
+                # cv2.imwrite(os.path.join(output_dir, f"{base_filename}_with_notes.png"), result)  # 保留音符的結果
+
+                print(f"已處理並保存圖片: {filename}")
+
+        print("所有圖片處理完成！結果已保存到:", output_dir)
+
+    def create_mosaics(self, train_dir, train_labels_dir, output_dir, output_labels_dir, num_mosaics=200):
+        """
+        創建馬賽克增強樣本，修正尺寸問題
+
+        參數:
+            train_dir: 訓練圖像目錄
+            train_labels_dir: 訓練標籤目錄
+            output_dir: 輸出馬賽克圖像目錄
+            output_labels_dir: 輸出馬賽克標籤目錄
+            num_mosaics: 要創建的馬賽克數量
+        """
+        import os
+        import cv2
+        import random
+        import numpy as np
+
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(output_labels_dir, exist_ok=True)
+
+        # 收集所有圖像和對應標籤
+        all_images = []
+        all_labels = []
+
+        for img_file in os.listdir(train_dir):
+            if img_file.endswith(('.jpg', '.png', '.jpeg')):
+                label_file = os.path.splitext(img_file)[0] + '.txt'
+                if os.path.exists(os.path.join(train_labels_dir, label_file)):
+                    all_images.append(img_file)
+                    all_labels.append(label_file)
+
+        num_images = len(all_images)
+        if num_images < 4:
+            print("沒有足夠的圖像來創建馬賽克")
+            return 0
+
+        # 限制馬賽克數量
+        num_mosaics = min(num_mosaics, num_images // 2)
+        print(f"將創建 {num_mosaics} 個馬賽克樣本")
+
+        created_mosaics = 0
+        for i in range(num_mosaics):
+            try:
+                # 隨機選擇4張圖像
+                selected_indices = random.sample(range(num_images), 4)
+
+                # 讀取圖像和標籤
+                images = []
+                boxes_list = []
+                classes_list = []
+
+                for idx in selected_indices:
+                    img_file = all_images[idx]
+                    label_file = all_labels[idx]
+
+                    # 讀取圖像
+                    img_path = os.path.join(train_dir, img_file)
+                    img = cv2.imread(img_path)
+
+                    if img is None:
+                        print(f"無法讀取圖像 {img_path}")
+                        continue
+
+                    h, w = img.shape[:2]
+                    images.append(img)
+
+                    # 讀取標籤
+                    boxes = []
+                    classes = []
+
+                    with open(os.path.join(train_labels_dir, label_file), 'r') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                cls_id = int(parts[0])
+                                x_center, y_center, width, height = map(float, parts[1:5])
+
+                                # 轉換為絕對坐標
+                                x1 = (x_center - width / 2) * w
+                                y1 = (y_center - height / 2) * h
+                                x2 = (x_center + width / 2) * w
+                                y2 = (y_center + height / 2) * h
+
+                                boxes.append([x1, y1, x2, y2])
+                                classes.append(cls_id)
+
+                    boxes_list.append(boxes)
+                    classes_list.append(classes)
+
+                # 確保有4張有效圖像
+                if len(images) != 4:
+                    continue
+
+                # 創建固定大小的馬賽克圖像
+                mosaic_size = 640  # 固定大小
+                mosaic_img = np.zeros((mosaic_size, mosaic_size, 3), dtype=np.uint8)
+
+                # 定義四個位置（左上、右上、左下、右下）
+                positions = [
+                    (0, 0, mosaic_size // 2, mosaic_size // 2),  # 左上 (x1, y1, x2, y2)
+                    (mosaic_size // 2, 0, mosaic_size, mosaic_size // 2),  # 右上
+                    (0, mosaic_size // 2, mosaic_size // 2, mosaic_size),  # 左下
+                    (mosaic_size // 2, mosaic_size // 2, mosaic_size, mosaic_size)  # 右下
+                ]
+
+                mosaic_boxes = []
+                mosaic_classes = []
+
+                # 處理每張圖像和其邊界框
+                for img_idx, (img, boxes, classes) in enumerate(zip(images, boxes_list, classes_list)):
+                    pos = positions[img_idx]
+                    x1, y1, x2, y2 = pos
+
+                    # 計算目標區域的寬度和高度
+                    target_w = x2 - x1
+                    target_h = y2 - y1
+
+                    # 調整圖像大小
+                    resized_img = cv2.resize(img, (target_w, target_h))
+
+                    # 放置到馬賽克圖像中
+                    mosaic_img[y1:y2, x1:x2] = resized_img
+
+                    # 調整邊界框坐標
+                    h, w = img.shape[:2]
+                    for box_idx, (box, cls) in enumerate(zip(boxes, classes)):
+                        orig_x1, orig_y1, orig_x2, orig_y2 = box
+
+                        # 計算邊界框在原始圖像中的相對位置
+                        rel_x1 = orig_x1 / w
+                        rel_y1 = orig_y1 / h
+                        rel_x2 = orig_x2 / w
+                        rel_y2 = orig_y2 / h
+
+                        # 計算在馬賽克圖像中的絕對位置
+                        new_x1 = x1 + rel_x1 * target_w
+                        new_y1 = y1 + rel_y1 * target_h
+                        new_x2 = x1 + rel_x2 * target_w
+                        new_y2 = y1 + rel_y2 * target_h
+
+                        # 確保邊界框在馬賽克圖像的邊界內
+                        new_x1 = max(0, min(new_x1, mosaic_size))
+                        new_y1 = max(0, min(new_y1, mosaic_size))
+                        new_x2 = max(0, min(new_x2, mosaic_size))
+                        new_y2 = max(0, min(new_y2, mosaic_size))
+
+                        # 跳過無效的邊界框（太小或者坐標有問題）
+                        if new_x2 <= new_x1 or new_y2 <= new_y1 or (new_x2 - new_x1) < 3 or (new_y2 - new_y1) < 3:
+                            continue
+
+                        mosaic_boxes.append([new_x1, new_y1, new_x2, new_y2])
+                        mosaic_classes.append(cls)
+
+                # 如果沒有有效的邊界框，跳過這個馬賽克
+                if not mosaic_boxes:
+                    continue
+
+                # 保存馬賽克圖像
+                mosaic_img_file = f"mosaic_{i}.jpg"
+                cv2.imwrite(os.path.join(output_dir, mosaic_img_file), mosaic_img)
+
+                # 保存標籤（轉換為YOLO格式）
+                with open(os.path.join(output_labels_dir, f"mosaic_{i}.txt"), 'w') as f:
+                    for (x1, y1, x2, y2), cls_id in zip(mosaic_boxes, mosaic_classes):
+                        # 轉換為YOLO格式（中心點+寬高）
+                        x_center = (x1 + x2) / (2 * mosaic_size)
+                        y_center = (y1 + y2) / (2 * mosaic_size)
+                        width = (x2 - x1) / mosaic_size
+                        height = (y2 - y1) / mosaic_size
+
+                        f.write(f"{cls_id} {x_center} {y_center} {width} {height}\n")
+
+                created_mosaics += 1
+                if created_mosaics % 10 == 0:
+                    print(f"已創建 {created_mosaics} 個馬賽克樣本")
+
+            except Exception as e:
+                print(f"創建馬賽克樣本時出錯: {str(e)}")
+
+        print(f"總共創建了 {created_mosaics} 個馬賽克樣本")
+        return created_mosaics
+
+    def prepare_dataset(self, enhance_dataset=False, create_mosaics=True, balance_classes=True):
+        """
+        準備並增強訓練數據集
+
+        參數:
+            enhance_dataset: 是否增強數據集
+            create_mosaics: 是否創建馬賽克增強
+            balance_classes: 是否平衡類別
+        """
+        import shutil  # 確保導入複製文件的模塊
+
+        print("開始準備和增強數據集...")
+
+        train_dir = os.path.join(self.dataset_path, "train/images")
+        train_labels_dir = os.path.join(self.dataset_path, "train/labels")
+
+        if not os.path.exists(train_dir):
+            print(f"訓練圖像目錄不存在: {train_dir}")
+            return False
+
+        if not os.path.exists(train_labels_dir):
+            print(f"訓練標籤目錄不存在: {train_labels_dir}")
+            return False
+
+        # 1. 分析數據集中的類別分布
+        class_counts = np.zeros(len(self.class_names))
+        label_files = [f for f in os.listdir(train_labels_dir) if f.endswith('.txt')]
+
+        for label_file in label_files:
+            label_path = os.path.join(train_labels_dir, label_file)
+            try:
+                with open(label_path, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 5:  # 確保標籤格式正確
+                            class_idx = int(float(parts[0]))
+                            if 0 <= class_idx < len(class_counts):
+                                class_counts[class_idx] += 1
+            except Exception as e:
+                print(f"處理標籤文件時出錯 {label_file}: {e}")
+
+        # 打印類別分布
+        print("\n數據集類別分布:")
+        for i, (name, count) in enumerate(zip(self.class_names, class_counts)):
+            print(f"  {name}: {int(count)} 個樣本")
+
+        # 2. 如果啟用，增強數據集
+        if enhance_dataset:
+            print("\n開始增強數據集...")
+            enhanced_dir = os.path.join(self.dataset_path, "train/enhanced")
+            enhanced_labels_dir = os.path.join(self.dataset_path, "train/enhanced_labels")
+
+            os.makedirs(enhanced_dir, exist_ok=True)
+            os.makedirs(enhanced_labels_dir, exist_ok=True)
+
+            # 找出稀有類別
+            rare_classes = []
+            for i, count in enumerate(class_counts):
+                if count < 30:  # 稀有類別閾值
+                    rare_classes.append(i)
+
+            if rare_classes:
+                print(f"稀有類別: {[self.class_names[i] for i in rare_classes]}")
+
+            # 為稀有類別創建更多增強樣本
+            rare_class_images = {}
+            for label_file in label_files:
+                image_file = label_file.replace('.txt', '.jpg')
+                if not os.path.exists(os.path.join(train_dir, image_file)):
+                    image_file = label_file.replace('.txt', '.png')
+
+                if not os.path.exists(os.path.join(train_dir, image_file)):
+                    continue
+
+                # 檢查標籤是否包含稀有類別
+                contains_rare = False
+                rare_classes_in_image = []
+
+                with open(os.path.join(train_labels_dir, label_file), 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 5:
+                            class_idx = int(parts[0])
+                            if class_idx in rare_classes:
+                                contains_rare = True
+                                rare_classes_in_image.append(class_idx)
+
+                if contains_rare:
+                    for cls in rare_classes_in_image:
+                        if cls not in rare_class_images:
+                            rare_class_images[cls] = []
+                        rare_class_images[cls].append((image_file, label_file))
+
+            # 創建增強樣本
+            augmentation_counts = {cls: min(100, max(50, 150 - int(count)))
+                                   for cls, count in enumerate(class_counts) if count < 150}
+
+            print(f"將創建額外增強樣本:")
+            for cls, count in augmentation_counts.items():
+                print(f"  {self.class_names[cls]}: +{count} 樣本")
+
+            # 使用Albumentations庫創建高品質增強
+            import albumentations as A
+            augmentations = A.Compose([
+                A.RandomRotate90(p=0.3),
+                A.HorizontalFlip(p=0.3),
+                A.RandomBrightnessContrast(p=0.5),
+                A.GaussNoise(p=0.3),
+                A.ElasticTransform(alpha=1, sigma=50, p=0.2),
+                A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
+                A.OpticalDistortion(distort_limit=0.3, p=0.2),
+            ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels']))
+
+            aug_count = 0
+            for cls, target_count in augmentation_counts.items():
+                if cls in rare_class_images:
+                    source_images = rare_class_images[cls]
+                    if not source_images:
+                        continue
+
+                    for i in range(target_count):
+                        img_file, label_file = random.choice(source_images)
+
+                        try:
+                            # 讀取圖像和標籤
+                            img_path = os.path.join(train_dir, img_file)
+                            img = cv2.imread(img_path)
+
+                            if img is None:
+                                continue
+
+                            # 讀取標籤
+                            boxes = []
+                            classes = []
+                            with open(os.path.join(train_labels_dir, label_file), 'r') as f:
+                                for line in f:
+                                    parts = line.strip().split()
+                                    if len(parts) >= 5:
+                                        cls_id = int(float(parts[0]))
+                                        x, y, w, h = map(float, parts[1:5])
+
+                                        # 轉換成絕對座標
+                                        x1 = (x - w / 2) * img.shape[1]
+                                        y1 = (y - h / 2) * img.shape[0]
+                                        x2 = (x + w / 2) * img.shape[1]
+                                        y2 = (y + h / 2) * img.shape[0]
+
+                                        boxes.append([x1, y1, x2, y2])
+                                        classes.append(cls_id)
+
+                            if not boxes:
+                                continue
+
+                            # 應用增強
+                            transformed = augmentations(image=img, bboxes=boxes, class_labels=classes)
+                            aug_img = transformed['image']
+                            aug_boxes = transformed['bboxes']
+                            aug_classes = transformed['class_labels']
+
+                            # 保存增強後的圖像
+                            aug_img_file = f"aug_{aug_count}_{img_file}"
+                            aug_label_file = f"aug_{aug_count}_{label_file}"
+
+                            cv2.imwrite(os.path.join(enhanced_dir, aug_img_file), aug_img)
+
+                            # 保存增強後的標籤
+                            h, w = aug_img.shape[:2]
+                            with open(os.path.join(enhanced_labels_dir, aug_label_file), 'w') as f:
+                                for (x1, y1, x2, y2), cls_id in zip(aug_boxes, aug_classes):
+                                    # 轉換回相對座標
+                                    x = (x1 + x2) / (2 * w)
+                                    y = (y1 + y2) / (2 * h)
+                                    width = (x2 - x1) / w
+                                    height = (y2 - y1) / h
+
+                                    f.write(f"{cls_id} {x} {y} {width} {height}\n")
+
+                            aug_count += 1
+
+                            if aug_count % 10 == 0:
+                                print(f"已創建 {aug_count} 個增強樣本")
+
+                        except Exception as e:
+                            print(f"創建增強樣本時出錯: {e}")
+
+            print(f"共創建了 {aug_count} 個增強樣本")
+
+            # 複製增強的圖像和標籤到原始訓練目錄
+            print("將增強樣本複製到訓練目錄...")
+            for img_file in os.listdir(enhanced_dir):
+                src_path = os.path.join(enhanced_dir, img_file)
+                dst_path = os.path.join(train_dir, img_file)
+                try:
+                    shutil.copy(src_path, dst_path)
+                except Exception as e:
+                    print(f"複製圖像時出錯 {img_file}: {e}")
+
+            for label_file in os.listdir(enhanced_labels_dir):
+                src_path = os.path.join(enhanced_labels_dir, label_file)
+                dst_path = os.path.join(train_labels_dir, label_file)
+                try:
+                    shutil.copy(src_path, dst_path)
+                except Exception as e:
+                    print(f"複製標籤時出錯 {label_file}: {e}")
+
+        # 3. 如果啟用，創建馬賽克增強
+        if create_mosaics:
+            print("\n開始創建馬賽克增強...")
+            mosaic_dir = os.path.join(self.dataset_path, "train/mosaic")
+            mosaic_labels_dir = os.path.join(self.dataset_path, "train/mosaic_labels")
+
+            # 使用改進後的馬賽克創建方法
+            created_count = self.create_mosaics(
+                train_dir=train_dir,
+                train_labels_dir=train_labels_dir,
+                output_dir=mosaic_dir,
+                output_labels_dir=mosaic_labels_dir,
+                num_mosaics=200
+            )
+
+            if created_count > 0:
+                # 複製馬賽克圖像和標籤到訓練目錄
+                print("將馬賽克樣本複製到訓練目錄...")
+                for img_file in os.listdir(mosaic_dir):
+                    src_path = os.path.join(mosaic_dir, img_file)
+                    dst_path = os.path.join(train_dir, img_file)
+                    try:
+                        shutil.copy(src_path, dst_path)
+                    except Exception as e:
+                        print(f"複製馬賽克圖像時出錯 {img_file}: {e}")
+
+                for label_file in os.listdir(mosaic_labels_dir):
+                    src_path = os.path.join(mosaic_labels_dir, label_file)
+                    dst_path = os.path.join(train_labels_dir, label_file)
+                    try:
+                        shutil.copy(src_path, dst_path)
+                    except Exception as e:
+                        print(f"複製馬賽克標籤時出錯 {label_file}: {e}")
+            else:
+                print("沒有創建任何馬賽克樣本")
+
+        # 4. 檢查最終數據集大小
+        final_images = len([f for f in os.listdir(train_dir) if f.endswith(('.jpg', '.png', '.jpeg'))])
+        final_labels = len([f for f in os.listdir(train_labels_dir) if f.endswith('.txt')])
+
+        print(f"\n數據集準備完成！")
+        print(f"最終數據集大小: {final_images} 張圖像, {final_labels} 個標籤文件")
+
+        return True
+
+    def train_with_custom_trainer(self, model_size="l", epochs=100, batch_size=4, image_size=640,
+                                  music_note_weight=2.0,
+                                  shape_loss_weight=0.5, focal_gamma=2.0,
+                                  rare_class_weight=3.0, rare_class_threshold=30,
+                                  enhanced_augmentation=True, mixed_precision=True,
+                                  feature_pyramid_enhancement=True, gradient_accumulation_steps=1,
+                                  prepare_dataset=False):
+        """使用自定義訓練器訓練音符物件偵測模型"""
+        import shutil
+        # 生成順序編號的訓練資料夾名稱
+        import os
+        base_dir = os.path.join(os.getcwd(), "music_notation_detection")
+        base_name = "custom_trainer"
+
+        # 查找現有的資料夾並確定下一個編號
+        existing_folders = [d for d in os.listdir(base_dir) if d.startswith(base_name)] if os.path.exists(
+            base_dir) else []
+
+        # 解析數字後綴
+        folder_numbers = []
+        for folder in existing_folders:
+            if folder == base_name:  # 沒有數字的基本資料夾
+                folder_numbers.append(0)
+            else:
+                try:
+                    suffix = folder[len(base_name):].strip('_')
+                    if suffix.isdigit():
+                        folder_numbers.append(int(suffix))
+                except:
+                    pass
+
+        # 確定下一個編號
+        next_number = 1 if not folder_numbers else max(folder_numbers) + 1
+        run_name = f"{base_name}_{next_number}" if next_number > 0 else base_name
+        # 準備配置文件
+        self.prepare_config()
+
+        # 如果需要，預處理數據集
+        if prepare_dataset:
+            self.prepare_dataset(enhance_dataset=True, create_mosaics=True, balance_classes=True)
+
+
+
+        # 清理 GPU 內存
+        import gc
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # 設置標準YOLO訓練參數
+        train_args = {
+            'data': self.config_path,
+            'epochs': epochs,
+            'batch': batch_size,
+            'imgsz': image_size,
+            'workers': 4,
+            'device': "0" if torch.cuda.is_available() else "cpu",
+            'amp': mixed_precision,  # 是否啟用自動混合精度，這個參數YOLO接受
+            'verbose': True,
+            'project': "music_notation_detection",
+            'name': run_name,  # 使用數字序列命名
+            'exist_ok': True,
+            # 常規訓練參數
+            'cos_lr': True,  # 餘弦學習率調度
+            'lr0': 0.01,  # 初始學習率
+            'lrf': 0.01,  # 最終學習率比例
+            'momentum': 0.937,  # SGD 動量
+            'weight_decay': 0.0005,  # 權重衰減
+            'warmup_epochs': 5.0,  # 預熱輪次
+            'warmup_momentum': 0.8,  # 預熱初始動量
+            'warmup_bias_lr': 0.1,  # 預熱初始偏置學習率
+            'patience': 40,  # 早停耐心值
+            'cls': 1.5,  # 分類損失權重，增加這個權重以改善分類
+            'box': 7.5,  # 邊界框損失權重
+            'dfl': 1.5,  # 分布焦點損失權重
+            'hsv_h': 0.015,  # 色調增強
+            'hsv_s': 0.7,  # 飽和度增強
+            'hsv_v': 0.4,  # 值增強
+            'degrees': 5.0,  # 旋轉增強
+            'translate': 0.1,  # 平移增強
+            'scale': 0.5,  # 縮放增強
+            'shear': 2.0,  # 剪切增強
+            'perspective': 0.0,  # 透視增強（設為0以避免過度扭曲音符）
+            'flipud': 0.0,  # 關閉垂直翻轉（音符位置敏感）
+            'fliplr': 0.5,  # 使用水平翻轉
+            'mosaic': 0.5,  # 馬賽克增強
+            'mixup': 0.1,  # 混合增強
+            'copy_paste': 0.1,  # 複製粘貼增強
+        }
+
+        # 自定義參數 - 不傳遞給YOLO訓練函數，而是在初始化自定義訓練器時傳遞
+        custom_args = {
+            'music_note_weight': music_note_weight,
+            'shape_loss_weight': shape_loss_weight,
+            'focal_gamma': focal_gamma,
+            'rare_class_weight': rare_class_weight,
+            'rare_class_threshold': rare_class_threshold,
+            'enhanced_augmentation': enhanced_augmentation,
+            'feature_pyramid_enhancement': feature_pyramid_enhancement,
+            'gradient_accumulation_steps': gradient_accumulation_steps,
+        }
+
+        # 加載預訓練模型
+        model_path = f"yolov8{model_size}.pt"
+        self.model = YOLO(model_path)
+
+        # 使用自定義訓練器進行訓練
+        try:
+            # 直接訪問模型的 trainer 屬性
+            self.model.trainer = MusicNotationTrainer
+
+            # 在模型內部創建一個自定義參數的屬性，以便訓練器訪問
+            if not hasattr(self.model, 'custom_args'):
+                setattr(self.model, 'custom_args', custom_args)
+
+            # 使用標準參數訓練模型
+            results = self.model.train(**train_args)
+
+            print(f"使用自定義訓練器訓練完成！")
+            print(f"結果保存在: {os.path.join(os.getcwd(), 'music_notation_detection/custom_trainer')}")
+
+            return self.model
+
+        except Exception as e:
+            print(f"自定義訓練器錯誤: {e}")
+            print("嘗試使用標準訓練器...")
+
+            # 如果自定義訓練器失敗，回退到標準訓練
+            results = self.model.train(**train_args)
+
+            print(f"標準訓練完成！結果保存在: {os.path.join(os.getcwd(), 'music_notation_detection/standard_trainer')}")
+
+            return self.model
+
+    def evaluate(self, custom_trainer=True, conf=0.25, iou=0.5):
+        """評估模型，增加了對評估配置的控制"""
+        if self.model is None:
+            # 嘗試載入最新訓練的模型
+            runs_dir = os.path.join(os.getcwd(), "music_notation_detection")
+            model_dir = "custom_trainer" if custom_trainer else "standard_trainer"
+            runs_path = os.path.join(runs_dir, model_dir)
+
+            if os.path.exists(runs_path):
+                weights_files = list(Path(runs_path).glob("weights/*.pt"))
+                if weights_files:
+                    latest_weights = str(sorted(weights_files, key=os.path.getmtime)[-1])
+                    print(f"載入最新訓練的模型: {latest_weights}")
+                    self.model = YOLO(latest_weights)
+                else:
+                    raise ValueError("找不到訓練好的模型權重文件")
+            else:
+                raise ValueError(f"找不到訓練目錄: {runs_path}")
+
+        # 執行評估
+        print(f"使用置信度閾值: {conf}, IoU閾值: {iou} 進行評估")
+        results = self.model.val(data=self.config_path, conf=conf, iou=iou)
+
+        print(f"評估結果: mAP@0.5 = {results.box.map50:.4f}, mAP@0.5:0.95 = {results.box.map:.4f}")
+
+        # 分析問題類別
+        problem_classes = []
+
+        if hasattr(results.box, 'mp_per_class'):
+            for i, (cls_name, precision) in enumerate(zip(self.class_names, results.box.mp_per_class)):
+                if precision < 0.5:  # 精確度低於0.5的類別
+                    problem_classes.append((cls_name, precision))
+
+            if problem_classes:
+                print("\n精確度較低的類別:")
+                for cls_name, precision in sorted(problem_classes, key=lambda x: x[1]):
+                    print(f"  - {cls_name}: 精確度 = {precision:.4f}")
+
+        # 分析漏檢問題
+        if hasattr(results.box, 'mr_per_class'):
+            missed_classes = []
+            for i, (cls_name, recall) in enumerate(zip(self.class_names, results.box.mr_per_class)):
+                if recall < 0.5:  # 召回率低於0.5的類別
+                    missed_classes.append((cls_name, recall))
+
+            if missed_classes:
+                print("\n召回率較低的類別 (漏檢問題):")
+                for cls_name, recall in sorted(missed_classes, key=lambda x: x[1]):
+                    print(f"  - {cls_name}: 召回率 = {recall:.4f}")
+
+        return results
+
+    def predict(self, image_path=None, save_dir="predictions", conf=0.25, custom_trainer=True):
+        """使用訓練好的模型進行預測"""
+        if self.model is None:
+            # 嘗試載入最新訓練的模型
+            runs_dir = os.path.join(os.getcwd(), "music_notation_detection")
+            model_dir = "custom_trainer" if custom_trainer else "standard_trainer"
+            runs_path = os.path.join(runs_dir, model_dir)
+
+            if os.path.exists(runs_path):
+                weights_files = list(Path(runs_path).glob("weights/*.pt"))
+                if weights_files:
+                    latest_weights = str(sorted(weights_files, key=os.path.getmtime)[-1])
+                    print(f"載入最新訓練的模型: {latest_weights}")
+                    self.model = YOLO(latest_weights)
+                else:
+                    raise ValueError("找不到訓練好的模型權重文件")
+            else:
+                raise ValueError(f"找不到訓練目錄: {runs_path}")
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 如果提供了特定圖像路徑，則預測該圖像
+        if image_path:
+            results = self.model.predict(image_path, conf=conf, save=True, project=save_dir)
+            print(f"預測完成，結果保存在: {save_dir}")
+            return results
+
+        # 否則預測測試集中的所有圖像
+        test_dir = os.path.join(self.dataset_path, "test/images")
+        if os.path.exists(test_dir):
+            results = self.model.predict(test_dir, conf=conf, save=True, project=save_dir)
+            print(f"測試集預測完成，結果保存在: {save_dir}")
+            return results
+        else:
+            print(f"警告: 找不到測試目錄 {test_dir}")
+            return None
+
+    def export_model(self, format="onnx", custom_trainer=True):
+        """將模型導出為各種格式以便部署"""
+        if self.model is None:
+            # 嘗試載入最新訓練的模型
+            runs_dir = os.path.join(os.getcwd(), "music_notation_detection")
+            model_dir = "custom_trainer" if custom_trainer else "standard_trainer"
+            runs_path = os.path.join(runs_dir, model_dir)
+
+            if os.path.exists(runs_path):
+                weights_files = list(Path(runs_path).glob("weights/*.pt"))
+                if weights_files:
+                    latest_weights = str(sorted(weights_files, key=os.path.getmtime)[-1])
+                    print(f"載入最新訓練的模型: {latest_weights}")
+                    self.model = YOLO(latest_weights)
+                else:
+                    raise ValueError("找不到訓練好的模型權重文件")
+            else:
+                raise ValueError(f"找不到訓練目錄: {runs_path}")
+
+        # 導出模型
+        try:
+            export_path = self.model.export(format=format)
+            print(f"模型成功導出為 {format} 格式: {export_path}")
+            return export_path
+        except Exception as e:
+            print(f"模型導出錯誤: {e}")
+            return None
+
+
+# 使用示例
+if __name__ == "__main__":
+    import shutil  # 確保導入複製文件的模塊
+
+    detector = MusicNotationDetector()
+
+    # 準備數據集（增強稀有類別）
+    detector.prepare_dataset(enhance_dataset=False, create_mosaics=False, balance_classes=True)
+
+    # 使用自定義訓練器訓練模型
+    detector.train_with_custom_trainer(
+        model_size="x",  # 使用小型模型便於快速實驗
+        epochs=500,  # 增加訓練輪次
+        batch_size=8,  # 增大批次大小以便更好的批次統計
+        image_size=640,  # 圖像尺寸
+        music_note_weight=2.5,  # 增加音符類別的權重
+        shape_loss_weight=0.6,  # 增加形狀損失的權重
+        focal_gamma=2.0,  # Focal Loss 的 gamma 參數
+        rare_class_weight=3.0,  # 增加稀有類別的權重
+        rare_class_threshold=30,  # 稀有類別的閾值
+        enhanced_augmentation=False,  # 使用增強的數據增強
+        mixed_precision=True,  # 使用混合精度訓練
+        feature_pyramid_enhancement=True,  # 使用特徵金字塔增強
+        gradient_accumulation_steps=2  # 使用梯度累積來增加等效批次大小
+    )
+
+    # 評估模型（使用較低的置信度閾值以提高召回率）
+    detector.evaluate(custom_trainer=True, conf=0.2, iou=0.5)
+
+    # 預測（使用較高的置信度閾值以提高精確度）
+    detector.predict(custom_trainer=True, conf=0.35)
+
+    # 導出模型以便部署
+    detector.export_model(format="onnx")
